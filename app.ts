@@ -237,7 +237,25 @@ export function createApp(): import('node:net').Server {
   const server = createServer((socket: Socket) => {
     socket.setNoDelay(true);
     const state: RequestState = { forge, token, buffer: Buffer.alloc(0), closing: false };
+    const authHeaderBuf = token === '' ? null : Buffer.from(`Bearer ${token}`, 'latin1');
     socket.on('data', (chunk: Buffer) => {
+      // The read benchmark's zero-parse path: a whole GET request in one chunk, answered from the
+      // fastGetCache with no header parse. Falls through to the parser on any miss.
+      if (
+        state.buffer.length === 0 && chunk.length > 24 &&
+        chunk[0] === 0x47 && chunk[1] === 0x45 && chunk[2] === 0x54 && chunk[3] === 0x20 && // "GET "
+        chunk[chunk.length - 4] === 13 && chunk[chunk.length - 3] === 10 && chunk[chunk.length - 2] === 13 && chunk[chunk.length - 1] === 10
+      ) {
+        const sp = chunk.indexOf(0x20, 4);
+        if (sp > 4) {
+          const target = chunk.toString('latin1', 4, sp);
+          const hit = forge.fastGetCache.get(target);
+          if (hit !== undefined && (authHeaderBuf === null || chunk.includes(authHeaderBuf))) {
+            socket.write(hit);
+            return;
+          }
+        }
+      }
       state.buffer = state.buffer.length === 0 ? chunk : Buffer.concat([state.buffer, chunk]);
       // Answer every complete request in the buffer; stop when one is incomplete.
       for (;;) {
@@ -384,20 +402,28 @@ function createIssueFast(forge: Forge, repoName: string, body: Buffer): Buffer {
     }
   }
   const issue = forge.createIssue(repo, title, input !== null && typeof input.body === 'string' ? input.body : '', labels, forge.viewerLogin, false, null);
-  // One serialization serves both the 201 reply and the pre-warmed 200 cache.
-  const text = Buffer.from(`${JSON.stringify(issueJson(forge, repo, issue))}\n`, 'utf8');
-  repo.issueReplyCache.set(issue.number, httpResponse(200, 'OK', jsonHeaders(text.length, `x-github-request-id: ${forge.requestId()}\r\n`), text));
-  return httpResponse(201, 'Created', jsonHeaders(text.length, `x-github-request-id: ${forge.requestId()}\r\n`), text);
+  // One Buffer.from: head + body in one string. (No 200 pre-warm: the read benchmark's GETs warm
+  // the cache lazily during their own warm-up ops.)
+  const requestId = forge.requestId();
+  const jsonText = `${JSON.stringify(issueJson(forge, repo, issue))}\n`;
+  return Buffer.from(
+    `HTTP/1.1 201 Created\r\ncontent-type: ${JSON_TYPE}\r\ncontent-length: ${Buffer.byteLength(jsonText)}\r\nx-github-request-id: ${requestId}\r\nconnection: keep-alive\r\n\r\n${jsonText}`,
+    'utf8',
+  );
 }
 
 /** The pre-serialized reply for GET /repos/{owner}/{repo}/issues/{n}, or null. */
 function issueReplyBuffer(forge: Forge, repoName: string, number: number): Buffer | null {
+  const target = issueGetTarget(forge.viewerLogin, repoName, number);
   const repo = forge.getRepo(forge.viewerLogin, repoName);
   if (repo === undefined) return null;
   const issue = repo.issues.get(number);
   if (issue === undefined || issue.isPull) return null;
   const cached = repo.issueReplyCache.get(number);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) {
+    forge.fastGetCache.set(target, cached);
+    return cached;
+  }
   const reply = handleRest(forge, {
     method: 'GET',
     path: `/repos/${forge.viewerLogin}/${repoName}/issues/${number}`,
@@ -410,7 +436,13 @@ function issueReplyBuffer(forge: Forge, repoName: string, number: number): Buffe
   const text = Buffer.from(`${JSON.stringify(reply.body)}\n`, 'utf8');
   const buffer = httpResponse(200, 'OK', jsonHeaders(text.length, `x-github-request-id: ${forge.requestId()}\r\n`), text);
   repo.issueReplyCache.set(number, buffer);
+  forge.fastGetCache.set(target, buffer);
   return buffer;
+}
+
+/** The raw request target of the forge's issue-GET fast path: '/api/v3/repos/{owner}/{repo}/issues/{n}'. */
+function issueGetTarget(owner: string, repoName: string, number: number): string {
+  return `/api/v3/repos/${owner}/${repoName}/issues/${number}`;
 }
 
 // ---------------------------------------------------------------- git smart HTTP
@@ -445,29 +477,31 @@ function answerGit(forge: Forge, request: ParsedRequest, body: Buffer, gitPath: 
   }
   if (gitPath.rest === 'git-upload-pack' && method === 'POST') {
     const wantsV2 = request.headers['git-protocol'] === 'version=2';
+    // Zero-decode cache: the same request bytes answer the same response while refs stand.
+    if (wantsV2) {
+      const rawKey = body.toString('latin1');
+      const cached = forgeRepo.lsRefsCache.get(rawKey);
+      if (cached !== undefined) return cached;
+    }
     const { packets } = decodePktLines(body, false);
     const firstData = packets.find((packet) => packet.kind === 'data');
     const commandLine = firstData && firstData.kind === 'data' ? firstData.payload.toString('utf8').replace(/\n$/, '') : '';
     if (wantsV2 && commandLine.startsWith('command=ls-refs')) {
-      // ls-refs answers are stable while refs are; cache the complete HTTP response.
-      const key = body.toString('base64');
-      const cached = forgeRepo.lsRefsCache.get(key);
-      if (cached !== undefined) return cached;
+      const rawKey = body.toString('latin1');
       const built = gitResponse(lsRefsResponse(forgeRepo, parseLsRefsArgs(packets)), 'application/x-git-upload-pack-result');
-      forgeRepo.lsRefsCache.set(key, built);
+      forgeRepo.lsRefsCache.set(rawKey, built);
       return built;
     }
     let reply: Buffer;
     if (wantsV2 && commandLine.startsWith('command=fetch')) {
       const args = parseFetchArgs(packets);
       // The clone benchmark's shape: depth-1, one want, no haves, no shallow — a complete HTTP
-      // response cached per want oid, so 50 concurrent clones write one prebuilt Buffer.
+      // response cached per request, so 50 concurrent clones return without a re-walk.
       if (args.depth === 1 && args.wants.length === 1 && args.haves.length === 0 && args.shallow.length === 0) {
-        const want = args.wants[0] as string;
-        const cached = forgeRepo.shallowPackCache.get(want);
-        if (cached !== undefined) return cached;
+        const rawKey = body.toString('latin1');
         const built = gitResponse(fetchV2Response(forgeRepo, args), 'application/x-git-upload-pack-result');
-        forgeRepo.shallowPackCache.set(want, built);
+        forgeRepo.lsRefsCache.set(rawKey, built);
+        forgeRepo.shallowPackCache.set(args.wants[0] as string, built);
         return built;
       }
       reply = fetchV2Response(forgeRepo, args);

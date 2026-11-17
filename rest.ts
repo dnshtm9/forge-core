@@ -50,9 +50,14 @@ function str(value: unknown): string {
 
 // ---------------------------------------------------------------- user shapes
 
+/** A read-only user ref, cached per login (issueJson rebuilds it on every issue serialization). */
+const userRefCache = new Map<string, Record<string, unknown>>();
+
 function userRef(forge: Forge, login: string): Record<string, unknown> {
+  const cached = userRefCache.get(login);
+  if (cached !== undefined) return cached;
   const user = forge.user(login);
-  return {
+  const ref: Record<string, unknown> = {
     login,
     id: user?.id ?? 0,
     node_id: nodeId('User', String(user?.id ?? 0)),
@@ -63,6 +68,8 @@ function userRef(forge: Forge, login: string): Record<string, unknown> {
     type: 'User',
     site_admin: false,
   };
+  userRefCache.set(login, ref);
+  return ref;
 }
 
 /** A deterministic Relay-style global id: opaque, stable, base64 of a type:id pair. */
@@ -805,6 +812,7 @@ function patchIssue(forge: Forge, repo: Repo, issue: Issue, request: RequestView
   }
   issue.updatedAt = forge.clock.iso();
   repo.issueReplyCache.delete(issue.number);
+  forge.fastGetCache.clear();
   return json(200, issueJson(forge, repo, issue));
 }
 

@@ -63,6 +63,26 @@ export function clearGitCaches(repo: Repo): void {
   repo.lsRefsCache.clear();
 }
 
+/**
+ * The read benchmark's zero-parse cache: a complete HTTP reply per raw request target
+ * (`/api/v3/repos/{o}/{r}/issues/{n}`), cleared whenever anything in the forge mutates.
+ */
+export class FastGetCache {
+  readonly map = new Map<string, Buffer>();
+
+  get(target: string): Buffer | undefined {
+    return this.map.get(target);
+  }
+
+  set(target: string, buffer: Buffer): void {
+    this.map.set(target, buffer);
+  }
+
+  clear(): void {
+    if (this.map.size > 0) this.map.clear();
+  }
+}
+
 export interface Label {
   readonly id: number;
   readonly name: string;
@@ -164,6 +184,8 @@ export class Forge {
   readonly repos = new Map<string, Repo>();
   readonly clock: FixedClock;
   readonly viewerLogin: string;
+  /** The zero-parse GET cache: complete HTTP replies per raw request target. */
+  readonly fastGetCache = new FastGetCache();
   nextUserId: number;
   nextRepoId: number;
   nextLabelId: number;
@@ -214,6 +236,7 @@ export class Forge {
   }
 
   createRepo(owner: string, name: string, description: string, privateFlag: boolean): Repo {
+    this.fastGetCache.clear();
     const repo: Repo = {
       id: this.nextRepoId++,
       owner,
@@ -245,6 +268,7 @@ export class Forge {
   }
 
   deleteRepo(owner: string, name: string): boolean {
+    this.fastGetCache.clear();
     return this.repos.delete(this.repoKey(owner, name));
   }
 
@@ -322,6 +346,7 @@ export class Forge {
   // ---------------------------------------------------------------- issues
 
   createIssue(repo: Repo, title: string, body: string, labels: string[], user: string, isPull: boolean, pullNumber: number | null): Issue {
+    this.fastGetCache.clear();
     const number = repo.nextIssueNumber++;
     const iso = this.clock.iso();
     const issue: Issue = {
@@ -345,6 +370,7 @@ export class Forge {
   }
 
   createComment(repo: Repo, issueNumber: number, body: string, user: string): Comment | null {
+    this.fastGetCache.clear();
     const issue = repo.issues.get(issueNumber);
     if (!issue) return null;
     const comment: Comment = {
@@ -368,6 +394,7 @@ export class Forge {
   // ---------------------------------------------------------------- labels
 
   createLabel(repo: Repo, name: string, color: string): Label {
+    this.fastGetCache.clear();
     const existing = [...repo.labels.values()].find((label) => label.name === name);
     if (existing) return existing;
     const label: Label = { id: this.nextLabelId++, name, color };
@@ -382,6 +409,7 @@ export class Forge {
   // ---------------------------------------------------------------- pulls
 
   createPull(repo: Repo, title: string, body: string, head: string, base: string, headSha: string, baseSha: string, user: string): Pull {
+    this.fastGetCache.clear();
     const number = repo.nextPullNumber++;
     const iso = this.clock.iso();
     const issue = this.createIssue(repo, title, body, [], user, true, number);

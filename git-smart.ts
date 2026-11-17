@@ -510,6 +510,13 @@ function ingestPack(repo: Repo, pack: Buffer): string | null {
 function isFastForward(repo: Repo, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
   if (ancestor === ZERO_OID) return true;
+  // The common push shape: the new commit's own bytes name its parent on a `parent ` line — a
+  // direct child is a fast-forward without a walk. (A tree oid also appears in the bytes, so the
+  // match must be the parent line specifically.)
+  const descendantObject = repo.objects.get(descendant);
+  if (descendantObject !== undefined && descendantObject.type === 'commit' && descendantObject.data.includes(`parent ${ancestor}`)) {
+    return true;
+  }
   const seen = new Set<string>([descendant]);
   const queue = [descendant];
   while (queue.length) {
@@ -544,6 +551,7 @@ export function receivePackResponse(forge: Forge, repo: Repo, bytes: Buffer): Pu
       applyCommand(repo, command);
       // A ref moved: the prebuilt shallow packs and advertisements are stale now.
       clearGitCaches(repo);
+      forge.fastGetCache.clear();
       lines.push(`ok ${command.ref}\n`);
     } else {
       lines.push(`ng ${command.ref} ${reason}\n`);

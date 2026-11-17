@@ -875,6 +875,7 @@ function resolveMutation(ctx: ExecContext, source: unknown, field: FieldNode, pa
       node.issue.closedAt = forge.clock.iso();
       node.issue.updatedAt = forge.clock.iso();
       node.repo.issueReplyCache.delete(node.issue.number);
+      forge.fastGetCache.clear();
       return mutationPayload(ctx, 'CloseIssuePayload', field, child, path, { issue: node.issue });
     }
     case 'createPullRequest': {

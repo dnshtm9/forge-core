@@ -351,6 +351,7 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
   let offset = 12;
+  let sawDelta = false;
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
     const header = readVarintSize(buffer, offset);
@@ -358,6 +359,7 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
     const typeCode = (header.first >> 4) & 0x07;
     const entry: RawEntry = { offset: entryOffset, typeCode, data: Buffer.alloc(0) };
     if (typeCode === 6) {
+      sawDelta = true;
       const base = readOfsDeltaBase(buffer, offset);
       offset = base.next;
       if (base.baseOffset <= 0 || base.baseOffset > entryOffset) {
@@ -365,6 +367,7 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
       }
       entry.baseOffset = entryOffset - base.baseOffset;
     } else if (typeCode === 7) {
+      sawDelta = true;
       if (offset + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
       entry.baseOid = buffer.subarray(offset, offset + 20).toString('hex');
       offset += 20;
@@ -381,6 +384,17 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
     byOffset.set(entryOffset, entry);
   }
   if (offset !== trailerStart) throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
+
+  // The push benchmark's packs carry no deltas: hash and store directly, no resolution maps.
+  if (!sawDelta) {
+    const objects = new Map<string, GitObject>();
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode] as GitObjectType;
+      const oid = hashObject(type, entry.data);
+      if (!objects.has(oid)) objects.set(oid, { type, data: entry.data });
+    }
+    return { version, declaredCount, objects, checksumOk, deltaCount: 0 };
+  }
 
   const objects = new Map<string, GitObject>();
   const resolving = new Set<number>();
