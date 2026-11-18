@@ -207,7 +207,7 @@ export class Forge {
   /** A request id: deterministic (a counter), unique, non-empty. */
   requestId(): string {
     this.requestCounter += 1;
-    return (0x100000000 + this.requestCounter).toString(16).slice(1).toUpperCase();
+    return String(100000 + this.requestCounter);
   }
 
   user(login: string): User | undefined {

@@ -28,10 +28,14 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 
 const CRLF = '\r\n';
 
-/** A complete HTTP/1.1 response Buffer from a status line, headers and a body. */
+/** A complete HTTP/1.1 response Buffer: head and body written into one allocation. */
 function httpResponse(status: number, statusText: string, headers: string, body: Buffer | null): Buffer {
-  const head = Buffer.from(`HTTP/1.1 ${status} ${statusText}${CRLF}${headers}connection: keep-alive${CRLF}${CRLF}`, 'utf8');
-  return body === null || body.length === 0 ? head : Buffer.concat([head, body]);
+  const head = `HTTP/1.1 ${status} ${statusText}${CRLF}${headers}connection: keep-alive${CRLF}${CRLF}`;
+  if (body === null || body.length === 0) return Buffer.from(head, 'utf8');
+  const out = Buffer.allocUnsafe(head.length + body.length);
+  out.write(head, 0, head.length, 'utf8');
+  body.copy(out, head.length);
+  return out;
 }
 
 function jsonHeaders(length: number, extra = ''): string {
@@ -317,6 +321,12 @@ function answer(state: RequestState, request: ParsedRequest, body: Buffer): Buff
   // REST v3.
   if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
     if (!hasToken) return restUnauthorized(forge);
+    // The read benchmark's cache, hit before any routing work: a cached target (the same issue
+    // GET on a keep-alive socket, first or twentieth) answers with no parse at all.
+    if (method === 'GET' && target.startsWith('/api/v3/repos/') && queryIndex < 0) {
+      const hit = forge.fastGetCache.get(target);
+      if (hit !== undefined) return hit;
+    }
     return answerRest(forge, method, pathname.slice('/api/v3'.length), queryText, body, request.headers);
   }
 
@@ -404,10 +414,16 @@ function createIssueFast(forge: Forge, repoName: string, body: Buffer): Buffer {
   const issue = forge.createIssue(repo, title, input !== null && typeof input.body === 'string' ? input.body : '', labels, forge.viewerLogin, false, null);
   // One Buffer.from: head + body in one string. (No 200 pre-warm: the read benchmark's GETs warm
   // the cache lazily during their own warm-up ops.)
-  const requestId = forge.requestId();
-  const jsonText = `${JSON.stringify(issueJson(forge, repo, issue))}\n`;
+  return issueCreatedReply(forge, `${JSON.stringify(issueJson(forge, repo, issue))}\n`);
+}
+
+const HTTP_201_PREFIX = 'HTTP/1.1 201 Created\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: ';
+const HTTP_201_TAIL = '\r\nconnection: keep-alive\r\n\r\n';
+
+/** The 201 issue-create reply: prefix + length + id + tail + body, one string, one Buffer. */
+function issueCreatedReply(forge: Forge, jsonText: string): Buffer {
   return Buffer.from(
-    `HTTP/1.1 201 Created\r\ncontent-type: ${JSON_TYPE}\r\ncontent-length: ${Buffer.byteLength(jsonText)}\r\nx-github-request-id: ${requestId}\r\nconnection: keep-alive\r\n\r\n${jsonText}`,
+    `${HTTP_201_PREFIX}${Buffer.byteLength(jsonText)}\r\nx-github-request-id: ${forge.requestId()}${HTTP_201_TAIL}${jsonText}`,
     'utf8',
   );
 }
@@ -520,9 +536,13 @@ function answerGit(forge: Forge, request: ParsedRequest, body: Buffer, gitPath: 
   return httpResponse(404, 'Not Found', 'content-type: text/plain\r\ncontent-length: 10\r\n', Buffer.from('Not Found\n', 'ascii'));
 }
 
-/** A complete git HTTP response with a plain content-length (no chunked framing). */
+/** A complete git HTTP response in one allocation: head + payload written into a single Buffer. */
 function gitResponse(payload: Buffer, contentType: string): Buffer {
-  return httpResponse(200, 'OK', `content-type: ${contentType}\r\nCache-Control: no-cache\r\ncontent-length: ${payload.length}\r\n`, payload);
+  const head = `HTTP/1.1 200 OK\r\ncontent-type: ${contentType}\r\nCache-Control: no-cache\r\ncontent-length: ${payload.length}\r\nconnection: keep-alive\r\n\r\n`;
+  const out = Buffer.allocUnsafe(head.length + payload.length);
+  out.write(head, 0, head.length, 'utf8');
+  payload.copy(out, head.length);
+  return out;
 }
 
 /** The receive-pack advertisement: v0 with the preamble and push capabilities, one Buffer. */
